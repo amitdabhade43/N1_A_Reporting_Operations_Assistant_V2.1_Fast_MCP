@@ -1,0 +1,759 @@
+"""NinjaOne MCP Agent - lightweight FastAPI runtime.
+
+Agent behavior is configured in Markdown under agent/. Python is responsible for
+connecting to Foundry Local, discovering MCP tools, executing the agent loop,
+and serving the browser UI/API.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import re
+import csv
+import io
+import sqlite3
+import smtplib
+import html
+from email.message import EmailMessage
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from pydantic import BaseModel, Field
+
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+
+# Runtime settings are environment-driven so endpoint/model changes don't
+# require edits to Python code.
+FOUNDRY_BASE_URL = os.getenv("FOUNDRY_BASE_URL", "http://127.0.0.1:64414/v1").rstrip("/")
+FOUNDRY_API_KEY = os.getenv("FOUNDRY_API_KEY", "local")
+MODEL_PHI = os.getenv("FOUNDRY_MODEL_PHI", "phi-4-mini")
+MODEL_QWEN = os.getenv("FOUNDRY_MODEL_QWEN", "qwen3-vl-4b-instruct-generic-cpu")
+MCP_URL = os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp")
+HOST = os.getenv("HOST", "127.0.0.1")
+PORT = int(os.getenv("PORT", "8080"))
+REQUEST_TIMEOUT = int(os.getenv("MODEL_TIMEOUT", "180"))
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "5"))
+MAX_STORED_MESSAGES = int(os.getenv("MAX_STORED_MESSAGES", "5"))
+AGENT_RECURSION_LIMIT = int(os.getenv("AGENT_RECURSION_LIMIT", "8"))
+REPORT_DIR = ROOT / "reports"
+REPORT_DIR.mkdir(exist_ok=True)
+DB_PATH = ROOT / "assistant_data.sqlite3"
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+
+PROMPT_DIR = ROOT / "agent"
+STATIC_DIR = ROOT / "static"
+
+app = FastAPI(title="NinjaOne MCP Expert Agent")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# Streamable HTTP MCP client. Tool definitions are discovered from the server;
+# no NinjaOne tool names are hard-coded in the runtime.
+mcp_client = MultiServerMCPClient({
+    "ninjaone": {
+        "transport": "streamable_http",
+        "url": MCP_URL,
+    }
+})
+
+_tools: list[Any] | None = None
+_tools_lock = asyncio.Lock()
+_agents: dict[str, Any] = {}
+_agents_lock = asyncio.Lock()
+_sessions: dict[str, list[Any]] = {}
+_sessions_lock = asyncio.Lock()
+
+
+class ReportRequest(BaseModel):
+    title: str = "NinjaOne Report"
+    content: str
+    formats: list[str] = Field(default_factory=lambda: ["xlsx", "pdf"])
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+class ScheduleRequest(BaseModel):
+    name: str
+    prompt: str
+    formats: list[str] = Field(default_factory=lambda: ["xlsx", "pdf"])
+    cron: str
+    timezone: str = "Asia/Kolkata"
+    email_to: str = ""
+
+class ChatRequest(BaseModel):
+    session_id: str | None = None
+    model: str = "phi"
+    message: str
+
+
+def model_id_for(choice: str) -> str:
+    if choice == "phi":
+        return MODEL_PHI
+    if choice == "qwen":
+        return MODEL_QWEN
+    # Allow callers to pass an exact model ID configured by the endpoint.
+    if choice in {MODEL_PHI, MODEL_QWEN}:
+        return choice
+    raise HTTPException(status_code=400, detail=f"Unknown model selection: {choice}")
+
+
+def load_agent_instructions() -> str:
+    """Load agent behavior from Markdown so prompt changes don't require code edits."""
+    files = [
+        PROMPT_DIR / "ninjaone-expert.md",
+        PROMPT_DIR / "instructions" / "tool-use.md",
+        PROMPT_DIR / "instructions" / "data-analysis.md",
+        PROMPT_DIR / "instructions" / "response-style.md",
+        PROMPT_DIR / "instructions" / "reporting-and-scheduling.md",
+        PROMPT_DIR / "skills" / "ninjaone-rmm" / "SKILL.md",
+        PROMPT_DIR / "references" / "tool-catalog-notes.md",
+    ]
+    chunks: list[str] = []
+    for path in files:
+        if path.exists():
+            chunks.append(f"\n\n<!-- Instructions: {path.relative_to(ROOT)} -->\n\n{path.read_text(encoding='utf-8')}")
+    if not chunks:
+        raise RuntimeError("No agent Markdown instruction files were found under agent/.")
+    return "\n".join(chunks)
+
+
+async def get_tools() -> list[Any]:
+    """Discover all tools exposed by the MCP server, caching the result."""
+    global _tools
+    async with _tools_lock:
+        if _tools is None:
+            try:
+                _tools = await mcp_client.get_tools()
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Cannot connect to MCP server at {MCP_URL}: {exc}")
+        return _tools
+
+
+def get_model(model_id: str) -> ChatOpenAI:
+    """Create an OpenAI-compatible client for Foundry Local."""
+    return ChatOpenAI(
+        model=model_id,
+        base_url=FOUNDRY_BASE_URL,
+        api_key=FOUNDRY_API_KEY,
+        temperature=0,
+        timeout=REQUEST_TIMEOUT,
+        max_retries=0,
+    )
+
+
+async def get_agent(model_id: str, tools: list[Any]):
+    """Create a LangChain tool-calling agent with all discovered MCP tools."""
+    async with _agents_lock:
+        if model_id not in _agents:
+            # Read prompt files at agent creation time. Restart app to reload edits.
+            _agents[model_id] = create_agent(
+                model=get_model(model_id),
+                tools=tools,
+                system_prompt=load_agent_instructions(),
+            )
+        return _agents[model_id]
+
+
+def content_to_text(content: Any) -> str:
+    """Convert text or multimodal message content into readable text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        pieces = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text" or "text" in item:
+                    pieces.append(str(item.get("text", "")))
+                elif item.get("type") == "image_url":
+                    pieces.append("[image attached]")
+            else:
+                pieces.append(str(item))
+        return "\n".join(p for p in pieces if p)
+    return str(content) if content is not None else ""
+
+
+def message_to_dict(message: Any) -> dict[str, Any]:
+    """Serialize a LangChain message for the browser activity panel."""
+    role = getattr(message, "type", "message")
+    result: dict[str, Any] = {"role": role, "content": content_to_text(getattr(message, "content", ""))}
+    name = getattr(message, "name", None)
+    if name:
+        result["name"] = name
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        result["tool_calls"] = tool_calls
+    return result
+
+
+def collect_tool_activity(messages: list[Any]) -> list[dict[str, Any]]:
+    """Extract tool-call and tool-result events from the agent trace."""
+    activity: list[dict[str, Any]] = []
+    for message in messages:
+        if getattr(message, "type", "") == "ai":
+            for call in getattr(message, "tool_calls", []) or []:
+                activity.append({
+                    "kind": "call",
+                    "tool": call.get("name", "tool"),
+                    "arguments": call.get("args", {}),
+                })
+        elif getattr(message, "type", "") == "tool":
+            activity.append({
+                "kind": "result",
+                "tool": getattr(message, "name", "tool"),
+                "result": content_to_text(getattr(message, "content", ""))[:5000],
+            })
+    return activity
+
+
+
+def parse_mcp_result(value: Any) -> Any:
+    """Unwrap MCP text content and parse JSON where possible."""
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, list):
+            parts = [parse_mcp_result(block.get("text", block) if isinstance(block, dict) else block) for block in content]
+            return parts[0] if len(parts) == 1 else parts
+        return value
+    if isinstance(value, list):
+        return [parse_mcp_result(item) for item in value]
+    if isinstance(value, str):
+        try:
+            return parse_mcp_result(json.loads(value.strip()))
+        except (json.JSONDecodeError, TypeError):
+            return value
+    return value
+
+
+def find_total_field(data: Any) -> int | None:
+    if isinstance(data, dict):
+        for key in ("totalCount", "total_count", "total", "count", "totalRecords"):
+            value = data.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        for key in ("pagination", "meta", "metadata", "pageInfo"):
+            found = find_total_field(data.get(key))
+            if found is not None:
+                return found
+    return None
+
+
+def flatten_records(data: Any) -> list[dict[str, Any]]:
+    data = parse_mcp_result(data)
+    if isinstance(data, dict):
+        for key in ("items", "data", "results", "records", "users", "technicians", "devices", "organizations", "roles"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+        return [data]
+    if isinstance(data, list):
+        records: list[dict[str, Any]] = []
+        for item in data:
+            item = parse_mcp_result(item)
+            if isinstance(item, dict):
+                if item.get("type") == "text" and isinstance(item.get("text"), str):
+                    nested = parse_mcp_result(item["text"])
+                    if isinstance(nested, dict): records.append(nested)
+                    elif isinstance(nested, list): records.extend(x for x in nested if isinstance(x, dict))
+                else:
+                    records.append(item)
+            elif isinstance(item, list):
+                records.extend(x for x in item if isinstance(x, dict))
+        return records
+    return []
+
+def detect_direct_tool_request(message: str, tools):
+    """Route uncomplicated inventory count/list questions directly to MCP."""
+    text = re.sub(r"\s+", " ", message.lower().strip())
+    if not text:
+        return None
+    count_intent = bool(re.search(r"\b(count|total|how many|number of)\b", text))
+    field_intent = bool(re.search(r"\b(first name|last name|full name|email|email id|email ids|names only|organization name|org name)\b", text))
+    list_intent = bool(re.search(r"\b(list|show|display|get|fetch|all|give me|what are|which are)\b", text))
+    implicit_list = bool(re.search(r"\b(organizations?|orgs?|technicians?|devices?|endpoints?|users?|roles?)\b", text))
+    if not (count_intent or list_intent or field_intent or implicit_list): return None
+    targets = [
+        ("technicians", ["technician", "technicians"], ["list_technicians"]),
+        ("devices", ["device", "devices", "endpoint", "endpoints"], ["list_devices"]),
+        ("organizations", ["organization", "organizations", "org", "orgs"], ["list_organizations"]),
+        ("users", ["user", "users"], ["list_users"]),
+        ("roles", ["role", "roles"], ["list_roles"]),
+    ]
+    selected = next(((plural, names) for plural, words, names in targets if any(re.search(rf"\b{re.escape(w)}\b", text) for w in words)), None)
+    if not selected or re.search(r"\b(where|with|whose|matching|search for|details for|status of|named|called)\b", text): return None
+    plural, tool_names = selected
+    tool = next((t for t in tools if t.name.lower() in tool_names), None)
+    if tool is None: return None
+    fields = None
+    if plural == "users" and field_intent:
+        if re.search(r"\b(email|email id|email ids|emails)\b", text): fields = ["email"]
+        elif re.search(r"\b(first name|last name|full name|names only)\b", text): fields = ["firstName", "lastName"]
+    elif plural == "organizations" and field_intent: fields = ["name"]
+    return tool.name, ("count" if count_intent else ("fields" if fields else "list")), fields
+
+
+async def run_direct_mcp_tool(tool_name: str, operation: str, fields: list[str] | None = None):
+    tools = await get_tools()
+    tool = next((t for t in tools if t.name == tool_name), None)
+    if tool is None: raise HTTPException(status_code=502, detail=f"MCP tool not found: {tool_name}")
+    started = time.perf_counter()
+    try: raw = await tool.ainvoke({})
+    except Exception as exc: raise HTTPException(status_code=502, detail=f"MCP tool {tool_name} failed: {exc}")
+    parsed = parse_mcp_result(raw)
+    records = flatten_records(parsed)
+    total = find_total_field(parsed)
+    activity = [{"kind":"call", "tool":tool_name, "arguments":{}}, {"kind":"result", "tool":tool_name, "result":str(parsed)[:5000]}]
+    noun = tool_name.removeprefix("list_")
+    if operation == "count":
+        count = total if total is not None else len(records)
+        basis = "reported by NinjaOne" if total is not None else "in the records returned by NinjaOne"
+        answer = f"NinjaOne returned {count} {noun} {basis}."
+    elif operation == "fields" and fields:
+        rows=[]
+        for rec in records:
+            vals=[]
+            for field in fields:
+                val=rec.get(field)
+                if val is None and field in ("firstName","lastName"): val=rec.get({"firstName":"first_name","lastName":"last_name"}[field])
+                if val not in (None, ""): vals.append(str(val))
+            if vals: rows.append(" ".join(vals))
+        answer="\n".join(rows) if rows else f"No requested fields were present in the returned {noun}."
+    else:
+        answer="\n".join(json.dumps(r, ensure_ascii=False) for r in records) if records else json.dumps(parsed, indent=2, ensure_ascii=False, default=str)
+    print(f"[Direct MCP] tool={tool_name} elapsed={time.perf_counter()-started:.2f}s")
+    return answer, activity
+
+async def run_agent(session_id: str, model_id: str, message_content: Any):
+    """Run direct MCP routing for simple inventory requests; use LLM agent for complex work."""
+    tools = await get_tools()
+    if not tools:
+        raise HTTPException(status_code=502, detail="MCP server returned no tools.")
+
+    # Fast path: simple counts and inventory lists go straight to MCP without
+    # spending an LLM turn deciding whether to call a tool.
+    message_text = content_to_text(message_content)
+    direct_request = detect_direct_tool_request(message_text, tools)
+    if direct_request:
+        tool_name, operation, fields = direct_request
+        return await run_direct_mcp_tool(tool_name, operation, fields)
+
+    agent = await get_agent(model_id, tools)
+    async with _sessions_lock:
+        history = list(_sessions.get(session_id, []))[-MAX_HISTORY_MESSAGES:]
+        history.append(HumanMessage(content=message_content))
+
+    started = time.perf_counter()
+    try:
+        result = await agent.ainvoke(
+            {"messages": history},
+            config={"recursion_limit": AGENT_RECURSION_LIMIT},
+        )
+    except Exception as exc:
+        # Keep the full exception in server logs; return a useful but concise error.
+        print(f"[Agent error] {type(exc).__name__}: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=("Agent/model execution failed. Verify Foundry Local is running, "
+                    "the selected model is loaded, and its OpenAI-compatible endpoint "
+                    f"supports tool calling. Details: {exc}"),
+        )
+
+    messages = result.get("messages", [])
+    final_answer = ""
+    for msg in reversed(messages):
+        if getattr(msg, "type", "") == "ai" and getattr(msg, "content", None):
+            final_answer = content_to_text(msg.content)
+            if final_answer:
+                break
+
+    async with _sessions_lock:
+        _sessions[session_id] = messages[-MAX_STORED_MESSAGES:]
+
+    print(f"[Agent] model={model_id} elapsed={time.perf_counter() - started:.2f}s")
+    return final_answer or "The model returned no text response.", collect_tool_activity(messages)
+
+
+@app.get("/")
+async def index():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/config")
+async def get_config():
+    return {
+        "models": [
+            {"id": "phi", "label": "Phi model", "model_id": MODEL_PHI},
+            {"id": "qwen", "label": "Qwen vision model", "model_id": MODEL_QWEN},
+        ],
+        "foundry_base_url": FOUNDRY_BASE_URL,
+        "mcp_url": MCP_URL,
+    }
+
+
+@app.get("/api/health")
+async def health():
+    return {
+        "ok": True,
+        "foundry_base_url": FOUNDRY_BASE_URL,
+        "mcp_url": MCP_URL,
+        "mcp_tools_loaded": _tools is not None,
+        "prompt_files_loaded": all((PROMPT_DIR / p).exists() for p in [
+            "ninjaone-expert.md", "instructions/tool-use.md",
+            "instructions/data-analysis.md", "instructions/response-style.md", "instructions/reporting-and-scheduling.md",
+            "skills/ninjaone-rmm/SKILL.md", "references/tool-catalog-notes.md"
+        ]),
+    }
+
+
+@app.get("/api/tools")
+async def list_tools():
+    tools = await get_tools()
+    return {"tools": [{"name": t.name, "description": t.description} for t in tools]}
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    sid = req.session_id or str(uuid.uuid4())
+    answer, activity = await run_agent(sid, model_id_for(req.model), req.message)
+    return {"session_id": sid, "model": req.model, "answer": answer, "activity": activity}
+
+
+@app.post("/api/chat/image")
+async def chat_image(
+    model: str = Form(...),
+    message: str = Form(""),
+    session_id: str | None = Form(None),
+    image: UploadFile = File(...),
+):
+    if model != "qwen":
+        raise HTTPException(status_code=400, detail="Image input is available only for the configured Qwen vision model.")
+    if not (image.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Upload an image file.")
+    data = await image.read()
+    if len(data) > 12 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image exceeds 12 MB limit.")
+    mime = image.content_type if image.content_type in {"image/png", "image/jpeg", "image/webp", "image/gif"} else "image/jpeg"
+    encoded = base64.b64encode(data).decode("ascii")
+    content = [
+        {"type": "text", "text": message or "Analyze this image for NinjaOne IT support."},
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+    ]
+    sid = session_id or str(uuid.uuid4())
+    answer, activity = await run_agent(sid, model_id_for(model), content)
+    return {"session_id": sid, "model": model, "answer": answer, "activity": activity}
+
+
+@app.delete("/api/session/{session_id}")
+async def clear_session(session_id: str):
+    async with _sessions_lock:
+        _sessions.pop(session_id, None)
+    return {"ok": True}
+
+
+@app.post("/api/tools/reload")
+async def reload_tools():
+    """Clear tool/agent caches after the MCP server's tool catalog changes."""
+    global _tools
+    async with _tools_lock:
+        _tools = None
+    async with _agents_lock:
+        _agents.clear()
+    tools = await get_tools()
+    return {"ok": True, "tool_count": len(tools)}
+
+
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS schedules (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL,
+            formats TEXT NOT NULL, cron TEXT NOT NULL, timezone TEXT NOT NULL,
+            email_to TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL, last_run TEXT, last_status TEXT)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS report_runs (
+            id TEXT PRIMARY KEY, schedule_id TEXT, name TEXT, status TEXT,
+            created_at TEXT, files TEXT, summary TEXT)""")
+        db.commit()
+
+def safe_filename(name: str) -> str:
+    cleaned = "".join(c if c.isalnum() or c in "-_ " else "_" for c in name).strip()
+    return (cleaned.replace(" ", "_")[:80] or "report")
+
+def build_csv(content: str) -> bytes:
+    # A broadly compatible CSV: one section per report line, preserving Markdown text.
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Report content"])
+    for line in content.splitlines():
+        writer.writerow([line])
+    return output.getvalue().encode("utf-8-sig")
+
+def build_xlsx(title: str, content: str, metadata: dict[str, Any]) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Report"
+    ws.merge_cells("A1:F1")
+    ws["A1"] = title
+    ws["A1"].font = Font(size=18, bold=True, color="FFFFFF")
+    ws["A1"].fill = PatternFill("solid", fgColor="17365D")
+    ws["A1"].alignment = Alignment(vertical="center")
+    ws.row_dimensions[1].height = 30
+    ws["A3"] = "Generated"
+    ws["B3"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    row = 5
+    ws.cell(row,1,"Report content").font = Font(bold=True, color="FFFFFF")
+    ws.cell(row,1).fill = PatternFill("solid", fgColor="4472C4")
+    row += 1
+    for line in content.splitlines():
+        ws.cell(row,1,line)
+        ws.cell(row,1).alignment = Alignment(wrap_text=True, vertical="top")
+        row += 1
+    ws.column_dimensions["A"].width = 110
+    ws.freeze_panes = "A6"
+    for key, value in metadata.items():
+        pass
+    meta = wb.create_sheet("Report Info")
+    meta.append(["Property","Value"])
+    meta["A1"].font=Font(bold=True,color="FFFFFF")
+    meta["A1"].fill=PatternFill("solid",fgColor="17365D")
+    meta["B1"].font=Font(bold=True,color="FFFFFF")
+    meta["B1"].fill=PatternFill("solid",fgColor="17365D")
+    meta.append(["Title",title])
+    meta.append(["Generated",datetime.now().astimezone().isoformat()])
+    for k,v in metadata.items():
+        meta.append([str(k), json.dumps(v,ensure_ascii=False) if isinstance(v,(dict,list)) else str(v)])
+    meta.column_dimensions["A"].width=24
+    meta.column_dimensions["B"].width=90
+    return workbook_bytes(wb)
+
+def workbook_bytes(wb) -> bytes:
+    b=io.BytesIO()
+    wb.save(b)
+    return b.getvalue()
+
+def build_pdf(title: str, content: str, metadata: dict[str, Any]) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.lib.utils import simpleSplit
+    b=io.BytesIO()
+    doc=SimpleDocTemplate(b,pagesize=letter,rightMargin=0.65*inch,leftMargin=0.65*inch,topMargin=0.65*inch,bottomMargin=0.65*inch)
+    styles=getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="ReportTitle",parent=styles["Title"],textColor=colors.HexColor("#17365D"),fontSize=22,leading=27,spaceAfter=12))
+    styles.add(ParagraphStyle(name="BodySmall",parent=styles["BodyText"],fontSize=8.5,leading=12,spaceAfter=5))
+    story=[Paragraph(html.escape(title),styles["ReportTitle"]),Paragraph("NinjaOne Operations Assistant · Generated "+datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z"),styles["BodyText"]),Spacer(1,14)]
+    if metadata:
+        rows=[["Report scope","Details"]]
+        for k,v in metadata.items():
+            rows.append([html.escape(str(k)),html.escape(str(v)[:500])])
+        t=Table(rows,colWidths=[1.5*inch,5.5*inch],repeatRows=1)
+        t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#17365D")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("GRID",(0,0),(-1,-1),0.35,colors.HexColor("#D5DCE5")),("VALIGN",(0,0),(-1,-1),"TOP"),("FONTSIZE",(0,0),(-1,-1),8),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F3F6FA")])]))
+        story += [t,Spacer(1,14)]
+    for line in content.splitlines():
+        stripped=line.strip()
+        if not stripped:
+            story.append(Spacer(1,5)); continue
+        if stripped.startswith("#"):
+            text=html.escape(stripped.lstrip("# ").strip())
+            story.append(Paragraph(text,styles["Heading2"]))
+        elif stripped.startswith("|"):
+            # Render Markdown tables as readable text rows; full markdown parsing is intentionally avoided.
+            story.append(Paragraph(html.escape(stripped.replace("|","  •  ")),styles["BodySmall"]))
+        elif stripped.startswith(("- ","* ")):
+            story.append(Paragraph("• "+html.escape(stripped[2:]),styles["BodySmall"]))
+        else:
+            story.append(Paragraph(html.escape(stripped),styles["BodySmall"]))
+    def footer(canvas,doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica",8)
+        canvas.setFillColor(colors.HexColor("#667085"))
+        canvas.drawString(0.65*inch,0.35*inch,"Confidential · NinjaOne report")
+        canvas.drawRightString(letter[0]-0.65*inch,0.35*inch,f"Page {doc.page}")
+        canvas.restoreState()
+    doc.build(story,onFirstPage=footer,onLaterPages=footer)
+    return b.getvalue()
+
+def create_report_files(title: str, content: str, formats: list[str], metadata: dict[str,Any]) -> list[dict[str,str]]:
+    allowed={"csv","xlsx","pdf"}
+    requested={x.lower().lstrip(".") for x in formats}
+    if not requested or not requested <= allowed:
+        raise ValueError("formats must contain only csv, xlsx, and/or pdf")
+    stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+    base=safe_filename(title)+"_"+stamp
+    outputs=[]
+    for fmt in sorted(requested):
+        data={"csv":lambda:build_csv(content),"xlsx":lambda:build_xlsx(title,content,metadata),"pdf":lambda:build_pdf(title,content,metadata)}[fmt]()
+        path=REPORT_DIR/f"{base}.{fmt}"
+        path.write_bytes(data)
+        outputs.append({"format":fmt,"filename":path.name,"url":f"/api/reports/files/{path.name}"})
+    return outputs
+
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+
+@app.post("/api/reports/generate")
+async def generate_report(req: ReportRequest):
+    try:
+        files=create_report_files(req.title,req.content,req.formats,req.metadata)
+    except Exception as exc:
+        raise HTTPException(status_code=400,detail=str(exc))
+    return {"ok":True,"title":req.title,"files":files}
+
+@app.get("/api/reports/files/{filename}")
+async def download_report(filename: str):
+    # Prevent path traversal; only files created in REPORT_DIR can be served.
+    if Path(filename).name != filename:
+        raise HTTPException(status_code=400,detail="Invalid filename")
+    path=REPORT_DIR/filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404,detail="Report file not found")
+    return FileResponse(path,filename=filename)
+
+def send_email_report(to_addr: str, subject: str, body: str, file_paths: list[Path]):
+    if not SMTP_HOST or not SMTP_FROM:
+        raise RuntimeError("SMTP_HOST and SMTP_FROM must be configured to enable email delivery.")
+    msg=EmailMessage()
+    msg["Subject"]=subject
+    msg["From"]=SMTP_FROM
+    msg["To"]=to_addr
+    msg.set_content(body)
+    for p in file_paths:
+        maintype="application"
+        subtype={"pdf":"pdf","xlsx":"vnd.openxmlformats-officedocument.spreadsheetml.sheet","csv":"csv"}.get(p.suffix[1:],"octet-stream")
+        msg.add_attachment(p.read_bytes(),maintype=maintype,subtype=subtype,filename=p.name)
+    with smtplib.SMTP(SMTP_HOST,SMTP_PORT,timeout=30) as server:
+        if SMTP_USE_TLS: server.starttls()
+        if SMTP_USER: server.login(SMTP_USER,SMTP_PASSWORD)
+        server.send_message(msg)
+
+async def execute_scheduled_report(schedule_id: str):
+    with sqlite3.connect(DB_PATH) as db:
+        row=db.execute("SELECT name,prompt,formats,timezone,email_to FROM schedules WHERE id=? AND enabled=1",(schedule_id,)).fetchone()
+    if not row: return
+    name,prompt,formats_json,tz,email_to=row
+    try:
+        # Scheduled reports execute a fresh agent query using a dedicated session.
+        answer,activity=await run_agent("schedule-"+schedule_id+"-"+str(uuid.uuid4()),MODEL_PHI,prompt)
+        metadata={"Schedule":name,"Prompt":prompt,"Tool calls":len(activity),"Timezone":tz}
+        files=create_report_files(name,answer,json.loads(formats_json),metadata)
+        paths=[REPORT_DIR/f["filename"] for f in files]
+        if email_to:
+            await asyncio.to_thread(send_email_report,email_to,name+" - NinjaOne report",answer,paths)
+        status="success"
+        summary=answer[:3000]
+        file_json=json.dumps(files)
+    except Exception as exc:
+        status="failed"; summary=str(exc); file_json="[]"
+    now=datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute("UPDATE schedules SET last_run=?,last_status=? WHERE id=?",(now,status,schedule_id))
+        db.execute("INSERT INTO report_runs(id,schedule_id,name,status,created_at,files,summary) VALUES(?,?,?,?,?,?,?)",(str(uuid.uuid4()),schedule_id,name,status,now,file_json,summary))
+        db.commit()
+
+def schedule_job(schedule_id: str, cron: str, timezone_name: str):
+    from apscheduler.triggers.cron import CronTrigger
+    try: tz=ZoneInfo(timezone_name)
+    except Exception as exc: raise ValueError(f"Unknown timezone: {timezone_name}") from exc
+    fields=cron.split()
+    if len(fields)!=5: raise ValueError("cron must use five fields: minute hour day month day_of_week")
+    trigger=CronTrigger.from_crontab(cron,timezone=tz)
+    scheduler.add_job(execute_scheduled_report,"cron",id=schedule_id,trigger=trigger,args=[schedule_id],replace_existing=True,misfire_grace_time=3600)
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+scheduler=AsyncIOScheduler()
+
+@app.on_event("startup")
+async def start_scheduler():
+    init_db()
+    scheduler.start()
+    with sqlite3.connect(DB_PATH) as db:
+        rows=db.execute("SELECT id,cron,timezone FROM schedules WHERE enabled=1").fetchall()
+    for sid,cron,tz in rows:
+        try: schedule_job(sid,cron,tz)
+        except Exception as exc: print(f"[Schedule load] {sid}: {exc}")
+
+@app.on_event("shutdown")
+async def stop_scheduler():
+    if scheduler.running: scheduler.shutdown(wait=False)
+
+@app.post("/api/reports/schedules")
+async def create_schedule(req: ScheduleRequest):
+    if not req.name.strip() or not req.prompt.strip():
+        raise HTTPException(status_code=400,detail="name and prompt are required")
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+        if len(req.cron.split())!=5: raise ValueError("Use five-field cron syntax")
+        CronTrigger.from_crontab(req.cron,timezone=ZoneInfo(req.timezone))
+        if not set(x.lower().lstrip(".") for x in req.formats) <= {"csv","xlsx","pdf"}: raise ValueError("Unsupported format")
+    except Exception as exc: raise HTTPException(status_code=400,detail=str(exc))
+    sid=str(uuid.uuid4())
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute("INSERT INTO schedules(id,name,prompt,formats,cron,timezone,email_to,enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(sid,req.name,req.prompt,json.dumps(req.formats),req.cron,req.timezone,req.email_to,1,datetime.now(timezone.utc).isoformat()))
+        db.commit()
+    try: schedule_job(sid,req.cron,req.timezone)
+    except Exception as exc: raise HTTPException(status_code=400,detail=str(exc))
+    return {"ok":True,"schedule_id":sid,"next_run":str(scheduler.get_job(sid).next_run_time)}
+
+@app.get("/api/reports/schedules")
+async def list_schedules():
+    with sqlite3.connect(DB_PATH) as db:
+        rows=db.execute("SELECT id,name,prompt,formats,cron,timezone,email_to,enabled,last_run,last_status FROM schedules ORDER BY created_at DESC").fetchall()
+    cols=["id","name","prompt","formats","cron","timezone","email_to","enabled","last_run","last_status"]
+    return {"schedules":[dict(zip(cols,r)) for r in rows]}
+
+@app.post("/api/reports/schedules/{schedule_id}/toggle")
+async def toggle_schedule(schedule_id: str, enabled: bool):
+    with sqlite3.connect(DB_PATH) as db:
+        row=db.execute("SELECT id,cron,timezone FROM schedules WHERE id=?",(schedule_id,)).fetchone()
+        if not row: raise HTTPException(status_code=404,detail="Schedule not found")
+        db.execute("UPDATE schedules SET enabled=? WHERE id=?",(1 if enabled else 0,schedule_id)); db.commit()
+    if enabled: schedule_job(row[0],row[1],row[2])
+    else:
+        try: scheduler.remove_job(schedule_id)
+        except Exception: pass
+    return {"ok":True,"enabled":enabled}
+
+@app.delete("/api/reports/schedules/{schedule_id}")
+async def delete_schedule(schedule_id: str):
+    try: scheduler.remove_job(schedule_id)
+    except Exception: pass
+    with sqlite3.connect(DB_PATH) as db:
+        cur=db.execute("DELETE FROM schedules WHERE id=?",(schedule_id,)); db.commit()
+        if cur.rowcount==0: raise HTTPException(status_code=404,detail="Schedule not found")
+    return {"ok":True}
+
+@app.get("/api/reports/history")
+async def report_history(limit: int = 50):
+    limit=max(1,min(limit,200))
+    with sqlite3.connect(DB_PATH) as db:
+        rows=db.execute("SELECT id,schedule_id,name,status,created_at,files,summary FROM report_runs ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()
+    cols=["id","schedule_id","name","status","created_at","files","summary"]
+    return {"runs":[dict(zip(cols,r)) for r in rows]}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host=HOST, port=PORT, reload=False)
